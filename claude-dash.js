@@ -143,6 +143,8 @@ async function runHook() {
     sid: p.session_id || 'unknown',
     cwd: p.cwd || '',
   };
+  // subagent içinden gelen olaylar agent_id taşır → ilgili satıra bağlanır, oturumun "şu an"ını ezmez
+  if (p.agent_id) { base.aid = String(p.agent_id); base.atype = p.agent_type || ''; }
   const ev = p.hook_event_name;
   const tool = p.tool_name;
   const inp = p.tool_input || {};
@@ -167,8 +169,17 @@ async function runHook() {
     append({ ...base, kind: 'idle' });
   } else if (ev === 'SubagentStop') {
     append({ ...base, kind: 'subagent_stop', id: p.agent_id || p.tool_use_id || '' });
+  } else if (ev === 'SubagentStart') {
+    append({ ...base, kind: 'subagent_start', id: String(p.agent_id || ''), agent: p.agent_type || 'agent' });
+  } else if (ev === 'PermissionRequest') {
+    // çıktı vermiyoruz → Claude normal izin ekranına düşer; biz sadece "seni bekliyor" diye gösteririz
+    append({ ...base, kind: 'perm', id: p.tool_use_id || '', tool: toolLabel(tool), detail: short(toolDetail(tool, inp), 160) });
+  } else if (ev === 'TaskCreated' || ev === 'TaskCompleted') {
+    // alan adları resmî dokümanda yok; savunmacı oku
+    const text = short(p.task_subject || p.subject || p.task_description || p.description || p.task_title || '', 140);
+    append({ ...base, kind: ev === 'TaskCreated' ? 'task_new' : 'task_done', tid: String(p.task_id || p.id || ''), text });
   } else if (ev === 'Notification') {
-    append({ ...base, kind: 'wait', msg: short(p.message || p.title || '', 160) });
+    append({ ...base, kind: 'wait', ntype: p.notification_type || '', msg: short(p.message || p.title || '', 160) });
   } else if (ev === 'PreToolUse') {
     if (tool === 'Task' || tool === 'Agent') {
       append({
@@ -237,9 +248,16 @@ function newSession(sid, cwd) {
     sid, cwd: cwd || '', label: '',
     startedAt: 0, lastActivity: 0,
     status: 'idle', ended: false,
-    current: null, waiting: '',
+    current: null, waiting: '', perm: null,
+    recent: [],
     agents: [], agentIdx: {}, todos: [],
   };
+}
+
+function findByAid(s, aid) {
+  if (!aid) return null;
+  for (let i = s.agents.length - 1; i >= 0; i--) if (s.agents[i].aid === aid) return s.agents[i];
+  return null;
 }
 
 function applyEvent(state, e) {
@@ -259,22 +277,62 @@ function applyEvent(state, e) {
       break;
     case 'prompt':
       s.label = e.text || s.label; s.status = 'working'; s.ended = false;
-      s.current = null; s.waiting = '';
+      s.current = null; s.waiting = ''; s.perm = null;
       break;
     case 'idle':
-      s.status = 'idle'; s.current = null; s.waiting = '';
+      s.status = 'idle'; s.current = null; s.waiting = ''; s.perm = null;
       break;
     case 'wait':
-      s.waiting = e.msg || 'onay/girdi bekleniyor';
+      if (e.ntype === 'idle_prompt') { s.status = 'idle'; s.current = null; break; }
+      if (!s.perm) s.waiting = e.msg || 'onay/girdi bekleniyor';
       break;
-    case 'tool_start':
-      s.status = 'working'; s.waiting = '';
-      s.current = { id: e.id, tool: e.tool, detail: e.detail || '', t: e.t };
+    case 'perm':
+      s.perm = { id: e.id || '', tool: e.tool || '', detail: e.detail || '', t: e.t };
+      s.waiting = (e.tool || 'araç') + (e.detail ? ' — ' + e.detail : '');
       break;
-    case 'tool_end':
-      if (s.current && (!e.id || s.current.id === e.id)) s.current = null;
-      s.waiting = '';
+    case 'tool_start': {
+      s.status = 'working'; s.waiting = ''; s.perm = null;
+      const cur = { id: e.id, tool: e.tool, detail: e.detail || '', t: e.t };
+      const a = findByAid(s, e.aid);
+      if (a) { a.current = cur; break; }
+      s.current = cur;
+      s.recent.push({ tool: e.tool, t: e.t });
+      if (s.recent.length > 6) s.recent.shift();
       break;
+    }
+    case 'tool_end': {
+      const a = findByAid(s, e.aid);
+      if (a) a.current = null;
+      else if (s.current && (!e.id || s.current.id === e.id)) s.current = null;
+      s.waiting = ''; s.perm = null;
+      break;
+    }
+    case 'subagent_start': {
+      if (!e.id || findByAid(s, e.id)) break;
+      const open = s.agents.filter((x) => (x.status === 'running' || x.status === 'background') && !x.aid).reverse();
+      let a = open.find((x) => x.agent === e.agent) || open.find((x) => x.agent !== 'workflow');
+      if (a && e.t - a.startedAt < 15000) { a.aid = e.id; break; }
+      // task_start'sız doğan ajan (workflow'un iç ajanı gibi): aktif workflow'un altına çocuk satır
+      const wf = s.agents.slice().reverse().find((x) => x.agent === 'workflow' && (x.status === 'running' || x.status === 'background'));
+      a = { id: 'sa|' + e.id, aid: e.id, agent: e.agent, desc: '', prompt: '', status: 'running',
+        startedAt: e.t, endedAt: 0, size: 0, model: '', parent: wf ? wf.id : '' };
+      s.agentIdx[a.id] = s.agents.length;
+      s.agents.push(a);
+      break;
+    }
+    case 'task_new': {
+      if (!e.text && !e.tid) break;
+      const it = { id: e.tid, c: e.text || e.tid, s: 'pending', a: '' };
+      const k = e.tid ? s.todos.findIndex((t) => t.id === e.tid) : -1;
+      if (k >= 0) s.todos[k] = it; else s.todos.push(it);
+      break;
+    }
+    case 'task_done': {
+      const k = e.tid ? s.todos.findIndex((t) => t.id === e.tid) : -1;
+      if (k >= 0) s.todos[k].s = 'completed';
+      else if (e.text) s.todos.push({ id: e.tid, c: e.text, s: 'completed', a: '' });
+      break;
+    }
     case 'task_start': {
       s.status = 'working'; s.waiting = '';
       const a = {
@@ -319,9 +377,11 @@ function applyEvent(state, e) {
       break;
     }
     case 'subagent_stop': {
-      const i = e.id ? s.agentIdx[e.id] : undefined;
+      let i = e.id ? s.agentIdx[e.id] : undefined;
+      if (i === undefined && e.id) { const k = s.agents.findIndex((x) => x.aid === e.id); if (k >= 0) i = k; }
       if (i !== undefined) {
         const a = s.agents[i];
+        a.current = null;
         if (a.status === 'running' || a.status === 'background') { a.status = 'done'; a.endedAt = e.t; }
       } else {
         // kimlik yoksa temkinli davran: yalnızca tek arka plan ajanı varken kapat
@@ -361,21 +421,24 @@ function snapshot(state) {
   const sessions = Object.values(state.sessions)
     .filter((s) => s.lastActivity >= cutoff)
     .sort((a, b) => {
-      const act = (s) => s.agents.some((x) => x.status === 'running' || x.status === 'background');
-      const ar = act(a) ? 0 : 1;
-      const br = act(b) ? 0 : 1;
-      return ar - br || b.lastActivity - a.lastActivity;
+      // sıra: seni bekliyor › aktif subagent › çalışıyor › boşta › bitti; eşitlikte son etkinlik
+      const rank = (s) => s.ended ? 4 : s.waiting ? 0
+        : s.agents.some((x) => x.status === 'running' || x.status === 'background') ? 1
+        : s.status === 'working' ? 2 : 3;
+      return rank(a) - rank(b) || b.lastActivity - a.lastActivity;
     })
     .map((s) => ({
       sid: s.sid, cwd: s.cwd, label: s.label,
       startedAt: s.startedAt, lastActivity: s.lastActivity,
       status: s.ended ? 'ended' : (s.waiting ? 'waiting' : s.status),
       waiting: s.waiting || '',
+      perm: s.perm,
       current: s.current,
+      recent: s.recent,
       todos: s.todos,
       agents: s.agents.map((a) => ({
-        agent: a.agent, desc: a.desc, prompt: a.prompt, status: a.status,
-        startedAt: a.startedAt, endedAt: a.endedAt, size: a.size, model: a.model,
+        id: a.id, parent: a.parent || '', agent: a.agent, desc: a.desc, prompt: a.prompt, status: a.status,
+        startedAt: a.startedAt, endedAt: a.endedAt, size: a.size, model: a.model, current: a.current || null,
       })),
     }));
   return { now: Date.now(), sessions };
@@ -531,96 +594,140 @@ const PAGE = `<!doctype html>
     --bg:#0d0f12; --panel:#14171c; --panel2:#1a1e24; --line:#252a32;
     --fg:#e6e9ee; --dim:#8b95a3; --dim2:#5d6672;
     --run:#4aa8ff; --done:#3ecf8e; --err:#ff6b6b; --wait:#f0b429; --idle:#5d6672;
+    --run-a:rgba(74,168,255,.35); --run-b:rgba(74,168,255,.07);
+    --wait-a:rgba(240,180,41,.45); --wait-b:rgba(240,180,41,.08);
+    --err-a:rgba(255,107,107,.35); --err-b:rgba(255,107,107,.07);
+  }
+  @media(prefers-color-scheme:light){
+    :root{ --bg:#f3f4f6; --panel:#ffffff; --panel2:#eceef2; --line:#d8dce3;
+      --fg:#1b1f26; --dim:#59626e; --dim2:#8b94a1; --idle:#8b94a1;
+      --run:#1c7ed6; --done:#12925f; --err:#d6455d; --wait:#b7791f;
+      --run-a:rgba(28,126,214,.35); --run-b:rgba(28,126,214,.06);
+      --wait-a:rgba(183,121,31,.5); --wait-b:rgba(183,121,31,.08);
+      --err-a:rgba(214,69,93,.35); --err-b:rgba(214,69,93,.06); }
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
     font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
     -webkit-font-smoothing:antialiased}
-  header{position:sticky;top:0;z-index:5;background:rgba(13,15,18,.92);
-    backdrop-filter:blur(8px);border-bottom:1px solid var(--line);
-    padding:12px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  header{position:sticky;top:0;z-index:5;background:var(--panel);
+    border-bottom:1px solid var(--line);
+    padding:10px 20px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   h1{font-size:14px;font-weight:600;margin:0;letter-spacing:.3px}
   .pill{font-size:12px;color:var(--dim);background:var(--panel2);
-    border:1px solid var(--line);border-radius:999px;padding:3px 10px}
+    border:1px solid var(--line);border-radius:999px;padding:3px 10px;white-space:nowrap}
   .pill b{color:var(--fg);font-weight:600}
+  .pill.warn{color:var(--wait);background:var(--wait-b);border-color:var(--wait-a);font-weight:600}
   .live{display:inline-block;width:7px;height:7px;border-radius:50%;
     background:var(--done);margin-right:6px;vertical-align:middle}
   .live.off{background:var(--err)}
-  main{padding:18px 20px 60px;display:flex;flex-direction:column;gap:16px;
+  .btn{font-size:12px;color:var(--dim);background:var(--panel2);border:1px solid var(--line);
+    border-radius:999px;padding:3px 10px;cursor:pointer;user-select:none}
+  .btn:hover{color:var(--fg)}
+  .toggle{font-size:12px;color:var(--dim);cursor:pointer;user-select:none;
+    display:flex;align-items:center;gap:6px}
+  .toggle input{accent-color:var(--run)}
+  .right{margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  main{padding:16px 20px 60px;display:flex;flex-direction:column;gap:12px;
     max-width:1400px;margin:0 auto}
+  .gtitle{font-size:11px;letter-spacing:.9px;text-transform:uppercase;color:var(--dim2);
+    font-weight:600;padding:6px 2px 0}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
-  .chead{display:flex;align-items:center;gap:10px;padding:12px 16px;
+  .card.waiting{border-color:var(--wait-a);box-shadow:0 0 0 4px var(--wait-b)}
+  .chead{display:flex;align-items:center;gap:10px;padding:10px 16px;
     border-bottom:1px solid var(--line);background:var(--panel2);flex-wrap:wrap}
-  .dot{width:8px;height:8px;border-radius:50%;flex:none}
-  .dot.working{background:var(--run);box-shadow:0 0 0 0 rgba(74,168,255,.6);animation:pulse 1.6s infinite}
-  .dot.waiting{background:var(--wait);box-shadow:0 0 0 0 rgba(240,180,41,.6);animation:pulse 1.6s infinite}
-  .dot.idle{background:var(--idle)} .dot.ended{background:var(--dim2)}
-  @keyframes pulse{70%{box-shadow:0 0 0 7px rgba(74,168,255,0)}100%{box-shadow:0 0 0 0 rgba(74,168,255,0)}}
+  .card.waiting .chead{background:var(--wait-b);border-bottom-color:var(--wait-a)}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none}
+  .dot.working{background:var(--run);box-shadow:0 0 0 0 var(--run-a);animation:pulse 1.6s infinite}
+  .dot.waiting{background:var(--wait);box-shadow:0 0 0 0 var(--wait-a);animation:pulse 1.2s infinite}
+  .dot.idle{background:var(--idle)} .dot.ended{background:var(--dim2);opacity:.5}
+  @keyframes pulse{70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
   .cwd{font-weight:600;font-size:13px}
-  .sid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--dim2)}
-  .meta{margin-left:auto;font-size:12px;color:var(--dim);display:flex;gap:12px;align-items:center}
-  .prompt{padding:9px 16px;font-size:12.5px;color:var(--dim);border-bottom:1px solid var(--line);
+  .sid{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;color:var(--dim2)}
+  .state{font-size:12.5px;color:var(--dim)}
+  .card.waiting .state{color:var(--wait);font-weight:600}
+  .meta{margin-left:auto;font-size:12px;color:var(--dim);display:flex;gap:12px;align-items:center;white-space:nowrap}
+  .prompt{padding:8px 16px;font-size:12.5px;color:var(--dim);border-bottom:1px solid var(--line);
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
   .prompt:hover{color:var(--fg)}
   .prompt.open{white-space:pre-wrap;overflow:visible;text-overflow:clip;word-break:break-word}
-  .now{padding:8px 16px;font-size:12.5px;color:var(--run);border-bottom:1px solid var(--line);
-    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .perm{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+  .perm svg{flex:none}
+  .perm .plabel{font-size:12px;color:var(--dim)}
+  .perm .pcmd{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:var(--fg);
+    background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:5px 10px;margin-top:3px;
+    word-break:break-all}
+  .now{display:flex;align-items:center;gap:8px;padding:7px 16px;font-size:12.5px;color:var(--run);
+    border-bottom:1px solid var(--line);flex-wrap:wrap}
   .now .tname{font-weight:600}
-  .now.wait{color:var(--wait)}
+  .now .detail{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
   .now.dimline{color:var(--dim2);font-style:italic}
+  .recent{margin-left:auto;display:flex;gap:4px;align-items:center;flex:none}
+  .recent .rl{font-size:10.5px;color:var(--dim2);margin-right:2px}
+  .chip{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;color:var(--dim);
+    background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:0 5px}
+  .chip.cur{color:var(--run);background:var(--run-b);border-color:var(--run-a)}
   .cols{display:grid;grid-template-columns:1.25fr 1fr;gap:0}
+  .cols.one{grid-template-columns:1fr}
   @media(max-width:820px){.cols{grid-template-columns:1fr}}
-  .col{padding:12px 16px 16px}
+  .col{padding:10px 16px 14px}
   .col+.col{border-left:1px solid var(--line)}
   @media(max-width:820px){.col+.col{border-left:0;border-top:1px solid var(--line)}}
   .ctitle{font-size:11px;letter-spacing:.9px;text-transform:uppercase;color:var(--dim2);
-    margin:0 0 10px;font-weight:600}
-  .ctitle span{color:var(--dim);margin-left:6px}
-  ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
-  li{display:flex;gap:9px;align-items:flex-start;padding:7px 9px;border-radius:8px;
+    margin:0 0 8px;font-weight:600}
+  .ctitle span{color:var(--dim);margin-left:6px;letter-spacing:0;text-transform:none}
+  ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:5px}
+  li{display:flex;gap:9px;align-items:flex-start;padding:6px 9px;border-radius:8px;
     background:var(--panel2);border:1px solid transparent;font-size:13px}
-  li.running{border-color:rgba(74,168,255,.35);background:rgba(74,168,255,.07)}
-  li.background{border-color:rgba(240,180,41,.35);background:rgba(240,180,41,.06)}
+  li.child{margin-left:22px;padding:4px 9px;font-size:12.5px}
+  li.running{border-color:var(--run-a);background:var(--run-b)}
+  li.background{border-color:var(--wait-a);background:var(--wait-b)}
   li.background .time{color:var(--wait)}
-  li.error{border-color:rgba(255,107,107,.35);background:rgba(255,107,107,.07)}
-  .mark{font-family:ui-monospace,Menlo,monospace;font-size:12px;flex:none;width:14px;
+  li.error{border-color:var(--err-a);background:var(--err-b)}
+  .mark{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;flex:none;width:14px;
     text-align:center;line-height:1.5}
   .mark.running{color:var(--run)} .mark.done{color:var(--done)}
   .mark.error{color:var(--err)} .mark.pending{color:var(--dim2)}
-  .mark.unknown{color:var(--wait)}
-  .mark.background{color:var(--wait)}
+  .mark.unknown,.mark.background{color:var(--wait)}
   .body{flex:1;min-width:0}
   .name{font-weight:600;font-size:12px;color:var(--run)}
   li.done .name,li.unknown .name{color:var(--dim)}
   .desc{color:var(--fg);word-break:break-word}
   li.done .desc{color:var(--dim)}
+  .acur{display:block;font-size:11px;color:var(--dim2);font-family:ui-monospace,Menlo,Consolas,monospace;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .todo-done .desc{color:var(--dim2);text-decoration:line-through}
   .todo-active .desc{color:var(--fg);font-weight:600}
-  .time{flex:none;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--dim2);
+  .time{flex:none;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;color:var(--dim2);
     padding-top:1px;min-width:46px;text-align:right}
   li.running .time{color:var(--run)}
   .empty{color:var(--dim2);font-size:12.5px;font-style:italic;padding:4px 2px}
+  .strip{display:flex;align-items:center;gap:10px;padding:7px 14px;border-radius:8px;
+    background:var(--panel);border:1px solid var(--line);font-size:12.5px;cursor:pointer}
+  .strip:hover{border-color:var(--dim2)}
+  .strip .lbl{color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
+  .strip .ago{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:var(--dim2);white-space:nowrap}
   .spin{display:inline-block;animation:sp 1s steps(8) infinite}
   @keyframes sp{to{transform:rotate(360deg)}}
   .hint{color:var(--dim2);font-size:13px;text-align:center;padding:60px 20px;line-height:1.8}
   code{background:var(--panel2);border:1px solid var(--line);border-radius:5px;
-    padding:2px 6px;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--fg)}
-  .toggle{margin-left:auto;font-size:12px;color:var(--dim);cursor:pointer;user-select:none;
-    display:flex;align-items:center;gap:6px}
-  .toggle input{accent-color:var(--run)}
+    padding:2px 6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--fg)}
 </style></head><body>
 <header>
   <h1>claude-dash</h1>
   <span class="pill"><span class="live" id="live"></span><span id="conn">bağlanıyor…</span></span>
+  <span class="pill warn" id="kWait" style="display:none"></span>
   <span class="pill">aktif subagent <b id="kRun">0</b></span>
-  <span class="pill">açık görev <b id="kTodo">0</b></span>
-  <label class="toggle"><input type="checkbox" id="onlyActive"> yalnızca aktif oturumlar</label>
+  <span class="right">
+    <span class="btn" id="notif" style="display:none" title="izin/girdi beklerken masaüstü bildirimi">bildirimleri aç</span>
+    <label class="toggle"><input type="checkbox" id="showEnded"> bitenleri göster</label>
+  </span>
 </header>
 <main id="root"><div class="hint">bekleniyor…</div></main>
 <script>
-var snap={now:Date.now(),sessions:[]}, skew=0, onlyActive=false, openPrompts={};
-var MARK={running:'\\u25CF',done:'\\u2713',error:'\\u2717',pending:'\\u25CB',
-          in_progress:'\\u25D0',completed:'\\u2713',unknown:'?',background:'\\u25D4'};
+var snap={now:Date.now(),sessions:[]}, skew=0, showEnded=false, openPrompts={}, openStrips={}, notified={};
+var MARK={running:'●',done:'✓',error:'✗',pending:'○',in_progress:'◐',completed:'✓',unknown:'?',background:'◔'};
+var PAUSE='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="7" y="5" width="3" height="14" rx="1"></rect><rect x="14" y="5" width="3" height="14" rx="1"></rect></svg>';
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function dur(ms){ if(ms<0)ms=0; var s=Math.floor(ms/1000);
@@ -631,86 +738,135 @@ function dur(ms){ if(ms<0)ms=0; var s=Math.floor(ms/1000);
 function ago(ts){return dur(Date.now()+skew-ts)+' önce';}
 function base(p){ if(!p)return '(dizin yok)'; var a=p.split(/[\\/\\\\]/).filter(Boolean); return a[a.length-1]||p;}
 function isActive(a){return a.status==='running'||a.status==='background';}
+function stateText(s,running){
+  if(s.status==='ended')return 'bitti';
+  if(s.status==='waiting')return s.perm?'izin bekliyor':'girdi bekliyor';
+  if(running)return '<span class="spin">◠</span> '+running+' aktif';
+  return s.status==='working'?'çalışıyor':'boşta';}
+
+function agentRow(a,now,child){
+  var el=(isActive(a)? now-a.startedAt : a.endedAt-a.startedAt);
+  var nm=a.agent+(a.status==='background'?' · arka plan':'');
+  var cur=(a.current&&isActive(a))?'<span class="acur">⚙ '+esc(a.current.tool)+(a.current.detail?' — '+esc(a.current.detail):'')+'</span>':'';
+  return '<li class="'+a.status+(child?' child':'')+'" title="'+esc(a.prompt)+'">'+
+    '<span class="mark '+a.status+'">'+(MARK[a.status]||'?')+'</span>'+
+    '<span class="body"><span class="name">'+esc(nm)+'</span> '+
+    '<span class="desc">'+esc(a.desc)+'</span>'+cur+'</span>'+
+    '<span class="time">'+dur(el)+'</span></li>';}
+
+function agentsHtml(s,now){
+  var tops=s.agents.filter(function(a){return !a.parent;}).sort(function(a,b){
+    var ar=isActive(a)?0:1, br=isActive(b)?0:1; return ar-br || b.startedAt-a.startedAt;});
+  if(!tops.length) return '<div class="empty">subagent / arka plan işi yok</div>';
+  return tops.map(function(a){
+    var kids=s.agents.filter(function(k){return k.parent===a.id;});
+    return agentRow(a,now,false)+kids.map(function(k){return agentRow(k,now,true);}).join('');
+  }).join('');}
+
+function card(s,now){
+  var running=s.agents.filter(isActive).length;
+  var open=s.todos.filter(function(t){return t.s!=='completed';}).length;
+  var tHtml=s.todos.map(function(t){
+    var cls=t.s==='completed'?'todo-done':(t.s==='in_progress'?'todo-active':'');
+    var txt=(t.s==='in_progress'&&t.a)?t.a:t.c;
+    return '<li class="'+cls+'"><span class="mark '+(t.s==='in_progress'?'running':t.s==='completed'?'done':'pending')+'">'+
+      (MARK[t.s]||'○')+'</span><span class="body"><span class="desc">'+esc(txt)+'</span></span></li>';}).join('');
+
+  var permLine='';
+  if(s.status==='waiting'&&s.perm){
+    permLine='<div class="perm" style="color:var(--wait)">'+PAUSE+'<div class="body"><div class="plabel">'+
+      esc(s.perm.tool)+' çalıştırmak için onay istiyor · '+dur(now-s.perm.t)+'</div>'+
+      (s.perm.detail?'<div class="pcmd">'+esc(s.perm.detail)+'</div>':'')+'</div></div>';
+  }else if(s.status==='waiting'){
+    permLine='<div class="perm" style="color:var(--wait)">'+PAUSE+'<div class="body"><div class="plabel">bekliyor: '+esc(s.waiting||'onay/girdi')+'</div></div></div>';
+  }
+  var nowLine='';
+  var chips=(s.recent||[]).length?'<span class="recent"><span class="rl">son</span>'+
+    s.recent.map(function(r,i){var last=i===s.recent.length-1&&s.current&&s.current.tool===r.tool;
+      return '<span class="chip'+(last?' cur':'')+'">'+esc(r.tool)+'</span>';}).join('')+'</span>':'';
+  if(s.current){
+    nowLine='<div class="now">⚙ <span class="tname">'+esc(s.current.tool)+'</span>'+
+      (s.current.detail?'<span class="detail">— '+esc(s.current.detail)+'</span>':'')+
+      '<span>· '+dur(now-s.current.t)+'</span>'+chips+'</div>';
+  }else if(s.status==='working'){
+    nowLine='<div class="now dimline">✍ yanıt hazırlanıyor…'+chips+'</div>';
+  }else if(chips){
+    nowLine='<div class="now dimline">'+chips+'</div>';
+  }
+  var cols=s.todos.length?'cols':'cols one';
+  return '<section class="card '+s.status+'"><div class="chead">'+
+    '<span class="dot '+s.status+'"></span>'+
+    '<span class="cwd">'+esc(base(s.cwd))+'</span>'+
+    '<span class="sid">'+esc(s.sid.slice(0,8))+'</span>'+
+    '<span class="state">'+stateText(s,running)+'</span>'+
+    '<span class="meta"><span>'+ago(s.lastActivity)+'</span></span></div>'+
+    (s.label?'<div class="prompt'+(openPrompts[s.sid]?' open':'')+'" data-sid="'+esc(s.sid)+
+      '" title="tıkla: tam metni aç/kapat">› '+esc(s.label)+'</div>':'')+
+    permLine+nowLine+
+    '<div class="'+cols+'"><div class="col"><h2 class="ctitle">Subagent &amp; arka plan'+
+    '<span>'+s.agents.length+(running?' · '+running+' aktif':'')+'</span></h2><ul>'+agentsHtml(s,now)+'</ul></div>'+
+    (s.todos.length?'<div class="col"><h2 class="ctitle">Görevler<span>'+open+' açık / '+s.todos.length+'</span></h2><ul>'+tHtml+'</ul></div>':'')+
+    '</div></section>';}
+
+function strip(s){
+  return '<div class="strip" data-strip="'+esc(s.sid)+'" title="tıkla: kartı aç">'+
+    '<span class="dot '+s.status+'"></span><span class="cwd">'+esc(base(s.cwd))+'</span>'+
+    '<span class="sid">'+esc(s.sid.slice(0,8))+'</span>'+
+    '<span class="lbl">'+(s.label?'› '+esc(s.label):'')+'</span>'+
+    '<span class="ago">'+(s.status==='ended'?'bitti · ':'')+ago(s.lastActivity)+'</span></div>';}
+
+function notify(s){
+  if(!('Notification' in window)||Notification.permission!=='granted')return;
+  var key=s.sid+'|'+(s.perm?s.perm.t:s.waiting);
+  if(notified[key])return; notified[key]=1;
+  try{ new Notification('claude-dash · '+base(s.cwd),{body:s.waiting||'onay/girdi bekliyor',tag:s.sid}); }catch(e){}
+}
 
 function render(){
   var now=Date.now()+skew, root=document.getElementById('root');
-  var sess=snap.sessions||[];
-  if(onlyActive) sess=sess.filter(function(s){return s.status!=='ended';});
-  var nRun=0,nTodo=0;
-  sess.forEach(function(s){
-    s.agents.forEach(function(a){if(isActive(a))nRun++;});
-    s.todos.forEach(function(t){if(t.s!=='completed')nTodo++;});
-  });
+  var sess=(snap.sessions||[]).filter(function(s){return showEnded||s.status!=='ended';});
+  var nRun=0,nWait=0;
+  sess.forEach(function(s){ s.agents.forEach(function(a){if(isActive(a))nRun++;}); if(s.status==='waiting'){nWait++; notify(s);} });
   document.getElementById('kRun').textContent=nRun;
-  document.getElementById('kTodo').textContent=nTodo;
+  var kw=document.getElementById('kWait'); kw.style.display=nWait?'':'none'; kw.textContent=nWait+' seni bekliyor';
+  document.title=(nWait?'('+nWait+') ':'')+'claude-dash';
+  var nb=document.getElementById('notif');
+  nb.style.display=('Notification' in window&&Notification.permission==='default')?'':'none';
 
   if(!sess.length){
     root.innerHTML='<div class="hint">Henüz olay yok.<br><br>'+
-      'Bir Claude Code oturumu başlatın; hook\\'lar kurulu ise<br>'+
+      'Bir Claude Code oturumu başlatın; hook kurulu ise<br>'+
       'subagent ve görev hareketleri burada anlık görünür.<br><br>'+
-      '<code>node claude-dash.js install</code> ile hook\\'ları ekleyebilirsiniz.</div>';
+      '<code>node claude-dash.js install</code> ile hook ekleyebilirsiniz.</div>';
     return;
   }
-  root.innerHTML=sess.map(function(s){
-    var agents=s.agents.slice().sort(function(a,b){
-      var ar=isActive(a)?0:1, br=isActive(b)?0:1;
-      return ar-br || b.startedAt-a.startedAt;});
-    var running=s.agents.filter(isActive).length;
-    var aHtml=agents.length? agents.map(function(a){
-      var el=(isActive(a)? now-a.startedAt : a.endedAt-a.startedAt);
-      var nm=a.agent+(a.status==='background'?' \\u00B7 arka plan':'');
-      return '<li class="'+a.status+'" title="'+esc(a.prompt)+'">'+
-        '<span class="mark '+a.status+'">'+(MARK[a.status]||'?')+'</span>'+
-        '<span class="body"><span class="name">'+esc(nm)+'</span> '+
-        '<span class="desc">'+esc(a.desc)+'</span></span>'+
-        '<span class="time">'+dur(el)+'</span></li>';
-    }).join('') : '<div class="empty">subagent / arka plan işi yok</div>';
-
-    var open=s.todos.filter(function(t){return t.s!=='completed';}).length;
-    var tHtml=s.todos.length? s.todos.map(function(t){
-      var cls=t.s==='completed'?'todo-done':(t.s==='in_progress'?'todo-active':'');
-      var txt=(t.s==='in_progress'&&t.a)?t.a:t.c;
-      return '<li class="'+cls+'"><span class="mark '+(t.s==='in_progress'?'running':t.s==='completed'?'done':'pending')+'">'+
-        (MARK[t.s]||'\\u25CB')+'</span><span class="body"><span class="desc">'+esc(txt)+'</span></span></li>';
-    }).join('') : '<div class="empty">görev listesi boş</div>';
-
-    var nowLine='';
-    if(s.status==='waiting'){
-      nowLine='<div class="now wait">\\u23F8 bekliyor: '+esc(s.waiting||'onay/girdi')+'</div>';
-    }else if(s.current){
-      nowLine='<div class="now">\\u2699 <span class="tname">'+esc(s.current.tool)+'</span>'+
-        (s.current.detail?' \\u2014 '+esc(s.current.detail):'')+
-        ' \\u00B7 '+dur(now-s.current.t)+'</div>';
-    }else if(s.status==='working'){
-      nowLine='<div class="now dimline">\\u270D yanıt hazırlanıyor\\u2026</div>';
-    }
-
-    return '<section class="card"><div class="chead">'+
-      '<span class="dot '+s.status+'"></span>'+
-      '<span class="cwd">'+esc(base(s.cwd))+'</span>'+
-      '<span class="sid">'+esc(s.sid.slice(0,8))+'</span>'+
-      '<span class="meta"><span>'+(running?('<span class="spin">\\u25E0</span> '+running+' aktif'):
-        (s.status==='ended'?'bitti':s.status==='waiting'?'bekliyor':s.status==='working'?'çalışıyor':'boşta'))+'</span>'+
-      '<span>'+ago(s.lastActivity)+'</span></span></div>'+
-      (s.label?'<div class="prompt'+(openPrompts[s.sid]?' open':'')+'" data-sid="'+esc(s.sid)+
-        '" title="tıkla: tam metni aç/kapat">\\u203A '+esc(s.label)+'</div>':'')+
-      nowLine+
-      '<div class="cols"><div class="col"><h2 class="ctitle">Subagent & arka plan'+
-      '<span>'+s.agents.length+'</span></h2><ul>'+aHtml+'</ul></div>'+
-      '<div class="col"><h2 class="ctitle">Görevler<span>'+open+' açık / '+s.todos.length+'</span></h2>'+
-      '<ul>'+tHtml+'</ul></div></div></section>';
-  }).join('');
+  var full=[], quiet=[];
+  sess.forEach(function(s){
+    var busy=s.status==='waiting'||s.status==='working'||s.agents.some(isActive);
+    if(busy||openStrips[s.sid]) full.push(s); else quiet.push(s);
+  });
+  var html=full.map(function(s){return card(s,now);}).join('');
+  if(quiet.length){
+    html+='<div class="gtitle">Boşta · '+quiet.length+'</div>'+quiet.map(strip).join('');
+  }
+  root.innerHTML=html;
 }
 
-document.getElementById('onlyActive').addEventListener('change',function(e){
-  onlyActive=e.target.checked; render();});
+document.getElementById('showEnded').addEventListener('change',function(e){
+  showEnded=e.target.checked; render();});
+document.getElementById('notif').addEventListener('click',function(){
+  if('Notification' in window) Notification.requestPermission().then(render);});
 
 document.getElementById('root').addEventListener('click',function(ev){
   var el=ev.target;
-  while(el&&el.classList&&!el.classList.contains('prompt'))el=el.parentNode;
-  if(!el||!el.classList||!el.classList.contains('prompt'))return;
-  var sid=el.getAttribute('data-sid');
-  openPrompts[sid]=!openPrompts[sid]; render();});
+  while(el&&el.classList&&!el.classList.contains('prompt')&&!el.classList.contains('strip')&&!el.classList.contains('card'))el=el.parentNode;
+  if(!el||!el.classList)return;
+  if(el.classList.contains('prompt')){ var sid=el.getAttribute('data-sid'); openPrompts[sid]=!openPrompts[sid]; render(); return; }
+  if(el.classList.contains('strip')){ openStrips[el.getAttribute('data-strip')]=true; render(); return; }
+  if(el.classList.contains('card')&&ev.target.classList.contains('chead')){ /* başlığa tıkla: açık şeridi kapat */
+    var c=ev.target.parentNode; var s2=(snap.sessions||[]).filter(function(x){return openStrips[x.sid];});
+    s2.forEach(function(x){ if(c.innerHTML.indexOf(x.sid.slice(0,8))>=0) delete openStrips[x.sid]; }); render(); }
+});
 
 function connect(){
   var es=new EventSource('/events');
@@ -734,6 +890,10 @@ const HOOK_SPEC = [
   ['UserPromptSubmit', null],
   ['Stop', null],
   ['SubagentStop', null],
+  ['SubagentStart', null],
+  ['PermissionRequest', null],
+  ['TaskCreated', null],
+  ['TaskCompleted', null],
   ['Notification', null],
   ['SessionStart', null],
   ['SessionEnd', null],

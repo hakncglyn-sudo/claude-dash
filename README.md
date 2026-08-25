@@ -4,8 +4,8 @@ Claude Code oturumu devam ederken **son yazdığınız promptu, o anda çalışa
 subagent'ları / arka plan işlerini ve görev (todo) listesini** canlı gösteren küçük
 bir pano. Tek dosya, sıfır bağımlılık, sadece Node.js gerekiyor.
 
-**Token tüketmez:** hook'lar stdout'a hiçbir şey yazmaz (Claude bağlamına hiçbir şey
-enjekte edilmez), model/API çağrısı yoktur; her şey yerel çalışır. Maliyet yalnızca
+**Token tüketmez — tasarımın birinci kuralı:** hook'lar stdout'a hiçbir şey yazmaz (Claude
+bağlamına hiçbir şey enjekte edilmez), izin kararına karışmaz, model/API çağrısı yoktur; her şey yerel çalışır. Maliyet yalnızca
 tool çağrısı başına birkaç ms'lik kısa yerel node süreci.
 
 VS Code'da **Simple Browser** sekmesinde açarsanız editörden hiç çıkmadan izleyebilirsiniz.
@@ -88,14 +88,16 @@ Sekmeyi saga surukleyip terminalin yaninda sabit tutabilirsiniz.
 
 | Bölüm | İçerik |
 |---|---|
+| **Seni bekliyor** | İzin/girdi bekleyen oturum en üste çıkar, sarı çerçeveli kart olur; kartta hangi aracın (ör. `Bash — npm test`) onay istediği görünür. Üst barda **N seni bekliyor** rozeti, sekme başlığında `(N)`, isteğe bağlı masaüstü bildirimi ("bildirimleri aç"). |
 | **Son prompt** | O oturumda en son yazdığınız prompt (1000 karaktere kadar saklanır). Tek satır görünür; **tıklayınca tam metin açılır/kapanır**. Slash komutları `/komut argüman` olarak görünür. |
-| **Şu an** | O anda çalışan tool: `⚙ Bash — npm install · 12s` gibi canlı satır. Tool çalışmıyorsa "yanıt hazırlanıyor…", onay/girdi bekleniyorsa `⏸ bekliyor: …` (kart noktası da sarıya döner). |
-| **Subagent & arka plan** | Her `Task`/`Agent`/`Workflow` çağrısı ve arka plan Bash işleri: durum (`●` çalışıyor / `◔` arka planda / `✓` bitti / `✗` hata), canlı süre. Üzerine gelince agent'a verilen prompt tooltip olarak görünür. |
-| **Görevler** | O anki todo listesi; `in_progress` olan kalın ve "…yapılıyor" halinde, biten üstü çizili. |
-| **Üst bar** | Toplam aktif subagent + açık görev sayısı, bağlantı durumu, "yalnızca aktif oturumlar" filtresi. |
+| **Şu an** | O anda çalışan tool: `⚙ Bash — npm install · 12s` gibi canlı satır. Sağında **son 5 tool** çipi (Read → Grep → Edit…) ritmi gösterir. Tool çalışmıyorsa "yanıt hazırlanıyor…". |
+| **Subagent & arka plan** | Her `Task`/`Agent`/`Workflow` çağrısı ve arka plan Bash işleri: durum (`●` çalışıyor / `◔` arka planda / `✓` bitti / `✗` hata), canlı süre. Üzerine gelince agent'a verilen prompt tooltip olarak görünür. Subagent `agent_id` ile kesin eşleşir; **subagent'ın kendi tool çağrısı** satırının altında görünür, oturumun "şu an"ını ezmez. Workflow'un iç ajanları workflow satırının altında **girintili çocuk satır** olur. |
+| **Görevler** | Todo/görev listesi (`TodoWrite` ve yeni `TaskCreated/TaskCompleted` hook'ları). Liste boşsa bölüm çizilmez. |
+| **Boşta** | Çalışmayan oturumlar kart değil **tek satır şerit** (dizin · son prompt · ne zaman); tıklayınca kart açılır. Bitenler varsayılan gizli ("bitenleri göster"). |
+| **Üst bar** | Bağlantı durumu, seni bekleyen oturum sayısı, aktif subagent sayısı, bildirim ve "bitenleri göster" anahtarı. Açık/koyu tema sistemi izler. |
 
 Aynı anda birden fazla Claude Code oturumu çalışıyorsa her biri ayrı bir kart olur;
-aktif subagent'ı olan oturum en üste çıkar. Sunucu tek başına çalışır — oturumları
+sıra: seni bekliyor › aktif subagent › çalışıyor › boşta. Sunucu tek başına çalışır — oturumları
 kapatıp açsanız bile pano açık kalabilir.
 
 ## Komutlar
@@ -126,8 +128,10 @@ Kullanılan hook'lar:
 | `PreToolUse` (tüm tool'lar) | "şu an" satırı; `Task`/`Agent`/`Workflow` → subagent başladı; arka plan Bash → arka plan işi başladı |
 | `PostToolUse` (tüm tool'lar) | "şu an" temizliği; subagent bitti (başarı/hata/arka planda sürüyor); `TodoWrite` → görev listesi |
 | `UserPromptSubmit` | oturum etiketi + task bildirimlerinden arka plan iş bitişi |
-| `SubagentStop` | subagent'ın gerçek bitişi |
-| `Notification` | "onay/girdi bekliyor" durumu |
+| `SubagentStart` / `SubagentStop` | subagent'ın `agent_id` ile kesin başlangıç/bitişi; task_start'sız doğan ajanlar (workflow içi) çocuk satır olur |
+| `PermissionRequest` | "seni bekliyor" kartı: hangi araç, hangi komut. Hook karar **vermez** (çıktı yok) → normal izin ekranı aynen çalışır |
+| `TaskCreated` / `TaskCompleted` | görev listesi (alan adları savunmacı okunur) |
+| `Notification` | genel bekleme durumu; `idle_prompt` → boşta |
 | `Stop`, `SessionStart`, `SessionEnd` | oturum durumu |
 
 Hook betiği hiçbir şey yazdırmaz, her koşulda `0` ile çıkar ve `timeout: 5` ile
